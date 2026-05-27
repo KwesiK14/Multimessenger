@@ -11,8 +11,11 @@ import pandas as pd
 from bilby.core.prior import Uniform
 from bilby.core.prior.dict import PriorDict
 from scipy import integrate
+from scipy.constants import c
 from scipy.interpolate import interp1d
 from spherical_geometry.polygon import SphericalPolygon
+import pyphot
+from pyphot import unit
 import os
 
 ## Cosmology
@@ -121,6 +124,7 @@ def N_GRB_S(z):
 TDE_params = {'Model': 'tde_analytical', 'Rate Function': rate_TDE, 'Number Function': N_TDE, 'deltaT': 56.0/365.2425}
 SNII_params = {'Model': 'typeII_surrogate_sarin25', 'Rate Function': rate_SNII, 'Number Function': N_SNII, 'deltaT': 55.0/365.2425}
 SNIa_params = {'Model': 'salt2', 'Rate Function': rate_SNIa, 'Number Function': N_SNIa, 'deltaT': 25.0/365.2425}
+SNIax_params = {'Model': 'SNIax-PLAsTiCC', 'Rate Function': rate_SNIax, 'Number Function': N_SNIax}
 SNIb_params = {'Model': 'arnett', 'Rate Function': rate_SNIb, 'Number Function': N_SNIb, 'deltaT': 55.0/365.2425}
 SNIc_params = {'Model': 'type_1c', 'Rate Function': rate_SNIc, 'Number Function': N_SNIc, 'deltaT': 55.0/365.2425}
 GRB_L_params = {'Model': 'gaussian_redback', 'Rate Function': rate_GRB_S, 'Number Function': N_GRB_S, 'deltaT': 1.0/365.2425}
@@ -130,6 +134,7 @@ GRB_S_params = {'Model': 'gaussian_redback', 'Rate Function': rate_GRB_L, 'Numbe
 transients = {'TDE': TDE_params,
               'SNII': SNII_params,
               'SNIa': SNIa_params,
+              'SNIax': SNIax_params,
               'SNIb': SNIb_params,
               'SNIc': SNIc_params,
               'sGRB': GRB_L_params,
@@ -143,7 +148,8 @@ transients_GroupA = {'TDE': TDE_params,
                      'lGRB': GRB_L_params}
 
 transients_GroupB = {'SNIa': SNIa_params,
-                    'SNII': SNII_params}
+                    'SNII': SNII_params,
+                    'SNIax': SNIax_params}
 
 
 
@@ -168,17 +174,96 @@ def update_parameters(params, trans_type):
         vej = const*np.sqrt(Ek*1e51/mej)
         params['mej'] = mej
         params['f_nickel'] = f_nickel
-        params['vej'] = vej
-        
+        params['vej'] = vej        
+    elif trans_type == 'SNIax':
+        model = transients[trans_type]['Model']
+    elif trans_type == 'TDE':   ## For TDE, parameters pulled from well observed TDEs
+        model = transients[trans_type]['Model']
+        i = np.random.randint(0,10000)
+        TDE_Parameters = pd.read_csv('TDE_ParameterSpace')
+        for value, label in zip(TDE_Parameters.iloc[i], TDE_Parameters):
+            params[label] = value
     else:               ## For SNIa, SNII, SNIc, and TDE
         model = transients[trans_type]['Model']
         params = redback.priors.get_priors(model=model).sample()
     return params
 
+## SNIax Functions
+def generate_sniax_lightcurve(z, output='flux_density'):
+    rand_index = np.random.randint(0,1001)
+    sniax_file = f'SIMSED.SNIax/SED-Iax-{rand_index:04d}.dat.gz'
+
+    df = pd.read_csv(sniax_file, header=None, sep=r'\s+', names=['phase','wavelength','flux'])
+    df_redshift = df.copy()
+
+    dl = cosmo.luminosity_distance(z)
+
+    if z>=1e-6: # For extragalactic sources
+        dl = cosmo.luminosity_distance(z)
+    elif z<1e-6:    # Galactic sources, neglect redshift and luminosity distance 
+        dl = 0.00001    # 10 pc, where rest-frame SED is defined
+
+    df_redshift['wavelength'] = df['wavelength']*(1+z)
+    df_redshift['flux'] = (df['flux']*(0.00001/dl)**2)/(1+z)
+    df_redshift['phase'] = df['phase']*(1+z)
+
+    sed_obs = df_redshift.pivot(index='phase', columns='wavelength', values='flux')
+    sed_rf = df.pivot(index='phase', columns='wavelength', values='flux')
+    
+    ### Observed SED time series is complete, will now find integrated magnitude in each band
+    library = pyphot.get_library()
+    filters = ['SkyMapper_u', 'SkyMapper_g', 'SkyMapper_r', 'SkyMapper_i', 'SkyMapper_z']
+    passbands = library.load_filters(names=filters)
+
+    mags = pd.DataFrame(np.zeros((5,94)), index=['u', 'g', 'r', 'i', 'z'], columns=sed_obs.index)
+    band_fluxs = pd.DataFrame(np.zeros((5,94)), index=['u', 'g', 'r', 'i', 'z'], columns=sed_obs.index)
+
+    for i in range(len(sed_obs.index)):     # Loop through each phase/day
+        fluxes = np.array(sed_obs.iloc[i]) * unit['flam']   # Array of fluxes for the SED on a given day
+        ws = np.array(sed_obs.iloc[i].index) * unit['AA']   # Array of wavelengths
+        for band, j in zip(passbands, range(len(mags))):    # Loop through each filter
+            int_flux = band.get_flux(ws, fluxes).value
+            vega_mag = band.Vega_zero_mag
+            int_mag = -2.5 * np.log10(int_flux) - vega_mag
+            mags.iloc[j, i] = int_mag   # Add integrated magnitude to list for that mag
+            c_speed = c * 1e10    # in Angstrom/s
+            pivot_wavelength = band.lpivot.value
+            int_flux_mJy = (int_flux*pivot_wavelength**2)/(c_speed * 1e-26)
+            band_fluxs.iloc[j, i] = int_flux_mJy
+
+    if output == 'flux_density':
+        return band_fluxs   ## In mJy
+    elif output == 'magnitude':
+        return mags
+    else:
+        print('Invalid output type. Must be "flux_density" or "magnitude".')
+
+def extrapolate_sniax_lightcurve(lightcurve, max_days=1645):
+    log_lc = np.log10(lightcurve)   # Change mJy flux to log-space
+    last15phase = np.array(lightcurve.columns)[-15:]    # Last 15 datapoints, where original lc has poor time resolution, for linear decline
+    late_phase_extrap = np.arange(int(last15phase[0]), max_days, 1) # New time array for linear decline to max lifetime
+    logflux_extrap = pd.DataFrame(np.zeros((5, len(late_phase_extrap))), index=['u','g','r','i','z'], columns=late_phase_extrap)    # Empty array to fill extrapolated log flux
+    for i in range(5):
+        m, b = np.polyfit(last15phase, log_lc.iloc[i, -15:], deg=1)
+        logflux_extrap.iloc[i] = m*late_phase_extrap + b
+
+    late_phase_lc = logflux_extrap.copy()
+    late_phase_lc = 10**(logflux_extrap)
+
+    final_lc = lightcurve.combine_first(late_phase_lc)
+    return final_lc
+
+def interp_sniax_time(lightcurve, timescale):
+    mblc_interp = np.zeros((len(lightcurve.index), len(timescale)))
+    df_mblc_interp = pd.DataFrame(mblc_interp, index=lightcurve.index, columns=timescale)
+    for i in range(len(lightcurve.index)):
+        interpolator = interp1d(lightcurve.columns, lightcurve.iloc[i], kind='linear', bounds_error=False, fill_value=0)
+        df_mblc_interp.iloc[i] = interpolator(timescale)
+    return df_mblc_interp
 
 
 ## Miscellaneous Functions
-def flux_to_mag(flux):
+def flux_to_mag(flux):  # For flux density in mJy
     return -2.5*np.log10(flux) + 16.4
 
 def flux_error_to_mag(flux_err, flux_obs):
@@ -189,7 +274,7 @@ def mag_to_flux(mag):
 
 def add_noise(flux, sigma):
     noise = np.random.normal(0, sigma*flux, len(flux))
-    return flux + noise
+    return flux + noise, sigma*flux
 
 # ---------------------------------------
 # Class Setup Below
@@ -295,7 +380,7 @@ class TransientContaminants:
                 try:
                     parameters = {}
                     parameters = update_parameters(parameters, transient)
-                    parameters['redshift'] = z_interp(np.random.rand())
+                    parameters['redshift'] = float(z_interp(np.random.rand()))
                     sim_obs = SimulateGenericTransient(model=model, parameters=parameters, times=times, data_points=n_datapoints,
                                                         model_kwargs=kwargs, noise_term=0.02)
 
@@ -306,8 +391,8 @@ class TransientContaminants:
                     background_df = pd.DataFrame()
                     background_df['time'] = t_lisa
                     background_df['true_output'] = 3.6e-8           ## milliJanskys for ~35 mag 
-                    background_df['output'] = add_noise(background_df['true_output'], sigma_bg)
-                    background_df['output_error'] = sigma_bg
+                    background_df['output'], background_df['output_error'] = add_noise(background_df['true_output'], sigma_bg)
+                    # background_df['output_error'] = sigma_bg
 
                     source_df = sim_obs.data
                     source_df['time'] = source_df['time'] + t0 - 0.2
@@ -329,8 +414,8 @@ class TransientContaminants:
                     combined_df['magnitude_error'] = flux_error_to_mag(combined_df['output_error'], combined_df['output'])
 
                     master_data = combined_df[['time','band','true_magnitude','magnitude','magnitude_error']]
-
-                    master_data = master_data[(master_data['time'] < t0) | (master_data['band'].notna())]
+                    master_mask = (master_data['band'].isna()) & (master_data['time'] >= t0)
+                    master_data.loc[master_mask, ['true_magnitude', 'magnitude', 'magnitude_error']] = np.nan
                     master_data['band'] = master_data['band'].fillna(bands)
 
                     # saving lightcurve to FITS file
@@ -368,10 +453,23 @@ class TransientContaminants:
                 for i in range(int(N_type)):
                     try:
                         parameters = redback.priors.get_priors(model=model).sample()
-                        parameters['redshift'] = z_interp(np.random.rand())
+                        parameters['redshift'] = float(z_interp(np.random.rand()))
+                        # print(f'The redshift is {parameters['redshift']} and it is a(n) {type(parameters['redshift'])}.')
+
+                        # Cosmological Dimming w Distance Modulus
+                        mu = cosmo.distmod(parameters['redshift']).value
+                        # Global parameters for Tripp relation
+                        MB = -19.
+                        alph = 0.14
+                        beta = 3.1
+                        mB = mu + MB - alph*parameters['x1'] + beta*parameters['c']
+                        parameters['x0'] = 10**(-0.4 * (mB - 10.635))
+
                         sim_obs = SimulateGenericTransient(model=model, parameters=parameters,times=times, data_points=n_datapoints,
                                                             model_kwargs=kwargs, noise_term=0.02)
                         source_df = sim_obs.data
+
+                        source_df.loc[source_df['output_error'] == 0, ['output', 'true_output', 'output_error']] = np.nan
 
                         sigma_bg = 1e-9
                         randindex = np.random.randint(0,2000)
@@ -380,8 +478,8 @@ class TransientContaminants:
                         background_df = pd.DataFrame()
                         background_df['time'] = t_lisa
                         background_df['true_output'] = 3.6e-8           
-                        background_df['output'] = add_noise(background_df['true_output'], sigma_bg)
-                        background_df['output_error'] = sigma_bg
+                        background_df['output'], background_df['output_error'] = add_noise(background_df['true_output'], sigma_bg)
+                        # background_df['output_error'] = sigma_bg
 
                         source_df['time'] = source_df['time'] + t_start - 0.2
                         source_df = source_df[source_df['time'] < 1644]
@@ -404,13 +502,11 @@ class TransientContaminants:
                             tau = -1./slope
                             A = np.exp(intercept)
 
-                            f_extrap = A*np.exp(-(t_tail - t0)/tau)
-
                             t_full = source_df['time'].values
                             mask = t_full > t_tail.max()
 
                             true_flux_tail = A*np.exp(-(t_full[mask] - t0)/tau)
-                            flux_tail = add_noise(true_flux_tail, 0.2)                 
+                            flux_tail, ignore = add_noise(true_flux_tail, 0.2)                 
 
                             source_df.loc[mask, 'true_flux'] = true_flux_tail
                             source_df.loc[mask, 'flux'] = flux_tail
@@ -431,8 +527,8 @@ class TransientContaminants:
                         combined_df['magnitude_error'] = flux_error_to_mag(combined_df['output_error'], combined_df['output_sum'])
 
                         master_data = combined_df[['time','band','true_magnitude','magnitude','magnitude_error']]
-
-                        master_data = master_data[(master_data['time'] < t0) | (master_data['band'].notna())]
+                        master_mask = (master_data['band'].isna()) & (master_data['time'] >= t0)
+                        master_data.loc[master_mask, ['true_magnitude', 'magnitude', 'magnitude_error']] = np.nan
                         master_data['band'] = master_data['band'].fillna(bands)
 
                         # saving lightcurve to FITS file
@@ -451,7 +547,7 @@ class TransientContaminants:
                 for i in range(int(N_type)):
                     try:
                         parameters = redback.priors.get_priors(model=model).sample()
-                        parameters['redshift'] = z_interp(np.random.rand())
+                        parameters['redshift'] = float(z_interp(np.random.rand()))
 
                         source = SimulateGenericTransient(model=model, parameters=parameters, times=times, data_points=n_datapoints,
                                                             model_kwargs=kwargs, noise_term=0.02)
@@ -463,10 +559,10 @@ class TransientContaminants:
                         background_df = pd.DataFrame()
                         background_df['time'] = t_lisa
                         background_df['true_output'] = 3.6e-8          
-                        background_df['output'] = add_noise(background_df['true_output'], sigma_bg)
-                        background_df['output_error'] = sigma_bg
+                        background_df['output'], background_df['output_error'] = add_noise(background_df['true_output'], sigma_bg)
+                        # background_df['output_error'] = sigma_bg
 
-                        source_df['time'] = source_df['time'] + t0 -0.2
+                        source_df['time'] = source_df['time'] + t0 - 0.2
                         source_df = source_df[source_df['time'] <= 1644]
                         source_df['band'] = bands
 
@@ -489,8 +585,8 @@ class TransientContaminants:
                         combined_df['magnitude_error'] = combined_df['output_error_src']
 
                         master_data = combined_df[['time','band','true_magnitude','magnitude','magnitude_error']]
-
-                        master_data = master_data[(master_data['time'] < t0) | (master_data['band'].notna())]
+                        master_mask = (master_data['band'].isna()) & (master_data['time'] >= t0)
+                        master_data.loc[master_mask, ['true_magnitude', 'magnitude', 'magnitude_error']] = np.nan
                         master_data['band'] = master_data['band'].fillna(bands)
 
                         # saving lightcurve to FITS file
@@ -504,5 +600,60 @@ class TransientContaminants:
                         astro_table.write(filepath, overwrite=True)
                     except Exception:
                         print(f'Error producing {transient} lightcurve.')
+            if transient=='SNIax':
+                print(f'Producing {int(N_type)} {transient} lightcurves.')
+                for i in range(int(N_type)):
+                    try:
+                        ## Make SNIax lightcurves
+                        parameters = {}
+                        z = float(z_interp(np.random.rand()))
+                        parameters['redshift'] = z
+                        # Figure out what to do with parameters, maybe compile from SED.info
+                        raw_src_df = generate_sniax_lightcurve(z)
+                        latephase_df = extrapolate_sniax_lightcurve(raw_src_df)
+                        randindex = np.random.randint(0,2000)
+                        t0 = t_lisa[randindex]
 
+                        full_src_df = latephase_df.copy()
+                        full_src_df.columns += t0 - 0.2
+                        full_src_df = full_src_df.loc[:, full_src_df.columns <= 1644]   # Truncate to LISA timeline
+                        source_df = interp_sniax_time(full_src_df, t_lisa)  # Interpolate to LISA time grid
+
+                        bands_sniax = list(source_df.index)
+                        source_df.index = [f'true {band}-band flux' for band in source_df.index]
+                        for band in bands_sniax:
+                            bkg_flux = 3.6e-8
+                            flux = source_df.loc[f'true {band}-band flux'] + bkg_flux
+                            noisy_flux, flux_error = add_noise(flux, 0.2)
+                            source_df.loc[f'observed {band}-band flux'] = noisy_flux
+                            source_df.loc[f'{band}-band flux error'] = flux_error
+                            true_mags = flux_to_mag(flux)
+                            obs_mags = flux_to_mag(noisy_flux)
+                            mag_error = flux_error_to_mag(flux_error, flux)
+
+                            source_df.loc[f'true {band}-band magnitude'] = true_mags
+                            source_df.loc[f'observed {band}-band magnitude'] = obs_mags
+                            source_df.loc[f'{band}-band magnitude error'] = mag_error
+
+                        master_df = source_df.loc[['true u-band magnitude', 'true g-band magnitude', 'true r-band magnitude', 'true i-band magnitude', 'true z-band magnitude',
+                                                        'observed u-band magnitude', 'observed g-band magnitude', 'observed r-band magnitude', 'observed i-band magnitude', 'observed z-band magnitude',
+                                                        'u-band magnitude error', 'g-band magnitude error', 'r-band magnitude error', 'i-band magnitude error', 'z-band magnitude error', ]]
+                        master_data = master_df.T
+                        master_data.index.name = 'time'
+                        master_data = master_data.reset_index()
+
+                        # saving lightcurve to FITS file
+                        obj_id = f'{i:05d}'
+                        filename = f'{transient}_lightcurve_{obj_id}.fits'
+                        filepath = f'TransientContaminantsOutput/{filename}'
+                        astro_table = Table.from_pandas(master_data)
+                        astro_table.meta = {'Model': model,
+                                            'ID': obj_id}
+                        astro_table.meta.update(parameters)
+                        astro_table.write(filepath, overwrite=True)
+                    except Exception:
+                        print(f'Error producing {transient} lightcurve.')
+                        raise Exception
+
+                
         return

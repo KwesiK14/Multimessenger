@@ -121,7 +121,7 @@ def N_GRB_S(z):
 ## -------------------------------------------
 
 
-TDE_params = {'Model': 'tde_analytical', 'Rate Function': rate_TDE, 'Number Function': N_TDE, 'deltaT': 56.0/365.2425}
+TDE_params = {'Model': 'tde_fallback', 'Rate Function': rate_TDE, 'Number Function': N_TDE, 'deltaT': 56.0/365.2425}
 SNII_params = {'Model': 'typeII_surrogate_sarin25', 'Rate Function': rate_SNII, 'Number Function': N_SNII, 'deltaT': 55.0/365.2425}
 SNIa_params = {'Model': 'salt2', 'Rate Function': rate_SNIa, 'Number Function': N_SNIa, 'deltaT': 25.0/365.2425}
 SNIax_params = {'Model': 'SNIax-PLAsTiCC', 'Rate Function': rate_SNIax, 'Number Function': N_SNIax}
